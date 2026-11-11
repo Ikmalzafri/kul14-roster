@@ -71,26 +71,6 @@
   <!-- GunDB for Universal Zero-Config Real-Time Cloud Sync -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/gun/0.2020.1239/gun.min.js"></script>
 
-  <!-- Firebase SDKs for Live Multi-User Cloud Sync -->
-  <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-    import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-    import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
-
-    // Global handles for sync engine
-    window.fbModules = {
-      initializeApp,
-      getAuth,
-      signInAnonymously,
-      signInWithCustomToken,
-      onAuthStateChanged,
-      getFirestore,
-      doc,
-      setDoc,
-      onSnapshot
-    };
-    window.dispatchEvent(new CustomEvent('firebase-modules-ready'));
-  </script>
 
   <script>
     tailwind.config = {
@@ -2293,15 +2273,20 @@
     };
 
     // --- 2. CLOUD SYNC & LOCAL STORAGE ENGINE ---
-    let firestoreDb = null;
-    let firestoreAuth = null;
-    let cloudUnsubscribe = null;
+    // Netlify backend sync (primary) — roster stored in Netlify Database via /api/roster/:room
+    let serverPollTimer = null;
+    let serverVersion = 0;
+    let serverSyncRoom = null;
+    let serverPushInFlight = false;
+    let serverOnline = false;
+    let serverPendingPush = false;
     let gunDb = null;
     let gunRosterRef = null;
     let broadcastChannel = null;
 
-    function getAppId() {
-      return typeof __app_id !== 'undefined' ? __app_id : 'duty-roster-phone-app';
+    function rosterApiUrl(roomId) {
+      // Absolute URL: the page has a <base href> pointing elsewhere, so relative URLs would not hit this site.
+      return `${window.location.origin}/api/roster/${encodeURIComponent(roomId)}`;
     }
 
     function initRoomIdFromUrlOrStorage() {
@@ -2392,54 +2377,115 @@
         }
       }
 
-      // 3. Initialize Firebase if environment provides credentials
-      if (window.fbModules && typeof __firebase_config !== 'undefined') {
-        initFirebaseSync();
-      }
+      // 3. Initialize Netlify backend sync (persistent, shared across all devices)
+      initServerSync();
     }
 
-    async function initFirebaseSync() {
+    async function initServerSync() {
+      const roomId = state.roomId;
+      serverSyncRoom = roomId;
+      serverVersion = 0;
+      clearTimeout(serverPollTimer);
+
       try {
-        const { initializeApp, getAuth, signInWithCustomToken, signInAnonymously, getFirestore, doc, onSnapshot } = window.fbModules;
-        const firebaseConfig = JSON.parse(__firebase_config);
-        const app = initializeApp(firebaseConfig);
-        firestoreDb = getFirestore(app);
-        firestoreAuth = getAuth(app);
+        const res = await fetch(rosterApiUrl(roomId), { cache: 'no-store' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (serverSyncRoom !== roomId) return; // room switched meanwhile
+        serverOnline = true;
 
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(firestoreAuth, __initial_auth_token);
+        if (data.exists && data.payload) {
+          serverVersion = data.version;
+          applyCloudState(data.payload);
+          setSyncStatus('synced');
         } else {
-          await signInAnonymously(firestoreAuth);
+          // First device in this room: seed the database with the current local roster
+          await pushStateToServer();
         }
-
-        subscribeToFirebaseRoster();
       } catch (err) {
-        console.warn('Firebase sync fallback to P2P cloud:', err);
+        serverOnline = false;
+        console.warn('Netlify sync unavailable, using P2P fallback:', err);
       }
+
+      scheduleServerPoll();
     }
 
-    function subscribeToFirebaseRoster() {
-      if (!firestoreDb || !firestoreAuth?.currentUser) return;
-      const { doc, onSnapshot } = window.fbModules;
-      const appId = getAppId();
-      const rosterDocRef = doc(firestoreDb, 'artifacts', appId, 'public', 'data', 'rosters', state.roomId);
+    function scheduleServerPoll() {
+      clearTimeout(serverPollTimer);
+      const delay = document.hidden ? 30000 : 4000;
+      serverPollTimer = setTimeout(pollServer, delay);
+    }
 
-      if (cloudUnsubscribe) cloudUnsubscribe();
-
-      cloudUnsubscribe = onSnapshot(
-        rosterDocRef,
-        (snap) => {
-          if (snap.exists()) {
-            const data = snap.data();
-            applyCloudState(data);
+    async function pollServer() {
+      const roomId = state.roomId;
+      if (serverSyncRoom !== roomId) return;
+      // Retry a save that failed earlier (e.g. phone was offline)
+      if (serverPendingPush && !serverPushInFlight && !cloudSyncDebounceActive) {
+        if (await pushStateToServer()) setSyncStatus('synced');
+      }
+      // Skip while a local edit is being saved to avoid overwriting it
+      if (!serverPendingPush && !serverPushInFlight && !cloudSyncDebounceActive) {
+        try {
+          const res = await fetch(`${rosterApiUrl(roomId)}?since=${serverVersion}`, { cache: 'no-store' });
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const data = await res.json();
+          serverOnline = true;
+          if (serverSyncRoom === roomId && !serverPushInFlight && !cloudSyncDebounceActive &&
+              data.changed && data.version > serverVersion) {
+            serverVersion = data.version;
+            if (data.senderId !== state.clientId) applyCloudState(data.payload);
+            setSyncStatus('synced');
+          } else if (serverSyncRoom === roomId) {
             setSyncStatus('synced');
           }
-        },
-        (error) => {
-          console.warn('Firebase onSnapshot error:', error);
+        } catch (err) {
+          if (serverOnline) console.warn('Netlify sync poll failed:', err);
+          serverOnline = false;
+          setSyncStatus('syncing', 'Reconnecting...');
         }
-      );
+      }
+      scheduleServerPoll();
     }
+
+    async function pushStateToServer(payload) {
+      const roomId = state.roomId;
+      payload = payload || {
+        roomId,
+        updatedAt: new Date().toISOString(),
+        engineers: state.engineers,
+        overrides: state.overrides,
+        dayComments: state.dayComments,
+        config: state.config
+      };
+      serverPushInFlight = true;
+      try {
+        const res = await fetch(rosterApiUrl(roomId), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ senderId: state.clientId, payload })
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (serverSyncRoom === roomId && data.version > serverVersion) serverVersion = data.version;
+        serverOnline = true;
+        serverPendingPush = false;
+        return true;
+      } catch (err) {
+        serverOnline = false;
+        serverPendingPush = true;
+        console.warn('Netlify sync save failed:', err);
+        return false;
+      } finally {
+        serverPushInFlight = false;
+      }
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && serverSyncRoom) {
+        clearTimeout(serverPollTimer);
+        pollServer();
+      }
+    });
 
     function applyCloudState(data) {
       if (!data) return;
@@ -2472,13 +2518,16 @@
     }
 
     let cloudSyncDebounce = null;
+    let cloudSyncDebounceActive = false;
     function pushStateToCloud() {
       if (state.isApplyingRemoteUpdate) return;
       state.lastLocalUpdate = Date.now();
       setSyncStatus('syncing');
 
       clearTimeout(cloudSyncDebounce);
+      cloudSyncDebounceActive = true;
       cloudSyncDebounce = setTimeout(async () => {
+        cloudSyncDebounceActive = false;
         const payload = {
           roomId: state.roomId,
           updatedAt: new Date().toISOString(),
@@ -2508,16 +2557,11 @@
           }
         }
 
-        // 3. Push to Firebase if connected
-        if (firestoreDb && firestoreAuth?.currentUser) {
-          try {
-            const { doc, setDoc } = window.fbModules;
-            const appId = getAppId();
-            const rosterDocRef = doc(firestoreDb, 'artifacts', appId, 'public', 'data', 'rosters', state.roomId);
-            await setDoc(rosterDocRef, payload, { merge: true });
-          } catch (err) {
-            console.warn('Firebase put error:', err);
-          }
+        // 3. Save to Netlify Database (primary, persistent store)
+        const saved = await pushStateToServer(payload);
+        if (!saved && !gunRosterRef) {
+          setSyncStatus('syncing', 'Saved locally — retrying...');
+          return;
         }
 
         setSyncStatus('synced');
@@ -4049,12 +4093,6 @@
       syncFilterDropdown();
       renderRoster();
       initCloudSync();
-    });
-
-    window.addEventListener('firebase-modules-ready', () => {
-      if (typeof __firebase_config !== 'undefined') {
-        initFirebaseSync();
-      }
     });
   </script>
 
